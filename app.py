@@ -1,6 +1,6 @@
 """
-📦 面单识别 → Tracking 回填工具
-PDF filename = order number → OCR extracts tracking # → match to Excel by order number
+📦 面单文件名 → Tracking 回填工具
+PDF 文件名 = 订单号_Tracking → 直接解析文件名（无需OCR）→ 按订单号匹配回填 Excel
 """
 
 import streamlit as st
@@ -8,14 +8,6 @@ import pandas as pd
 import re
 import io
 from pathlib import Path
-from PIL import Image, ImageFilter, ImageEnhance
-import pytesseract
-
-try:
-    from pdf2image import convert_from_bytes
-    PDF_SUPPORT = True
-except ImportError:
-    PDF_SUPPORT = False
 
 try:
     import openpyxl
@@ -43,141 +35,37 @@ for key in ["extracted_labels", "match_results"]:
 if "excel_bytes" not in st.session_state:
     st.session_state.excel_bytes = None
 
-# ── OCR ──────────────────────────────────────────────────────────────────────
+# ── 文件名解析（替代 OCR）─────────────────────────────────────────────────────
 
-def preprocess_image(img: Image.Image) -> Image.Image:
-    img = img.convert("L")
-    img = ImageEnhance.Contrast(img).enhance(2.0)
-    img = img.filter(ImageFilter.SHARPEN)
-    w, h = img.size
-    if w < 1000:
-        img = img.resize((w * 2, h * 2), Image.LANCZOS)
-    return img
-
-
-def extract_tracking(text: str) -> str:
-    """Extract tracking number from OCR text."""
-    # UPS: look for TRACKING label
-    match = re.search(r'TRACKING\s*#?\s*:?\s*(1Z[\sA-Z0-9]+)', text, re.IGNORECASE)
-    if match:
-        clean = re.sub(r'\s+', '', match.group(1))
-        if clean.startswith('1Z') and len(clean) >= 18:
-            return clean[:18]
-        return clean
-
-    # UPS: find 1Z pattern anywhere
-    match = re.search(r'(1Z\s*[A-Z0-9]{3}\s*[A-Z0-9]{3}\s*[A-Z0-9]{2}\s*[A-Z0-9]{4}\s*[A-Z0-9]{4})', text, re.IGNORECASE)
-    if match:
-        clean = re.sub(r'\s+', '', match.group(1))
-        if len(clean) >= 18:
-            return clean[:18]
-        return clean
-
-    # FedEx: 12 or 15 digits
-    match = re.search(r'(?:TRACKING|TRACK)\s*#?\s*:?\s*(\d{12,15})', text, re.IGNORECASE)
-    if match:
-        return match.group(1)
-
-    # USPS: 20-22 digits
-    match = re.search(r'\b(\d{20,22})\b', text)
-    if match:
-        return match.group(1)
-
-    return ""
-
-
-def extract_recipient(text: str) -> str:
-    """Extract recipient name from OCR text (secondary info)."""
-    match = re.search(r'SHIP\s*TO\s*:?\s*\n\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
-    if match:
-        name = re.sub(r'[^\w\s\'-]', '', match.group(1).strip()).strip()
-        if len(name) >= 2 and not name.isdigit() and not re.match(r'^\d', name):
-            return name
-    return ""
-
-
-def extract_order_from_filename(filename: str) -> str:
-    """Extract order number from PDF filename.
-    e.g. '114-8302232-3163464.pdf' → '114-8302232-3163464'
-    or   '114-8302232-3163464 (1).pdf' → '114-8302232-3163464'
+def parse_filename(filename: str):
+    """从文件名解析 订单号 + Tracking。
+    文件名格式：订单号_Tracking.pdf
+    e.g. '114-8302232-3163464_1Z2W4A130342999947.pdf'
+         → 订单号 '114-8302232-3163464', Tracking '1Z2W4A130342999947'
+    只按第一个下划线切分，Tracking 内部如再有下划线会原样保留。
     """
-    stem = Path(filename).stem  # remove .pdf
-    # Remove common suffixes like (1), (2), _copy, etc.
-    stem = re.sub(r'\s*\(\d+\)\s*$', '', stem)
-    stem = re.sub(r'\s*_copy\s*$', '', stem, flags=re.IGNORECASE)
+    stem = Path(filename).stem                      # 去掉 .pdf / .png 等后缀
+    stem = re.sub(r'\s*\(\d+\)\s*$', '', stem)      # 去掉重复文件的 " (1)" 等尾巴
     stem = stem.strip()
-    # Validate: Amazon order numbers look like 114-8302232-3163464
-    # But accept any non-empty string as order number
-    return stem
+
+    if "_" not in stem:
+        return stem, ""                             # 没有下划线 → 只有订单号，无 Tracking
+
+    order, tracking = stem.split("_", 1)
+    # 如需让 Tracking 保留下划线本身（即 "_XXXX"），把上面这行换成：
+    # order, tracking = stem.split("_", 1); tracking = "_" + tracking
+    return order.strip(), tracking.strip()
 
 
-def process_file(file_bytes: bytes, filename: str) -> list:
-    """Process an uploaded file. Returns list of results."""
-    ext = Path(filename).suffix.lower()
-    order_number = extract_order_from_filename(filename)
-    results = []
-
-    if ext == ".pdf":
-        if not PDF_SUPPORT:
-            return [{"filename": filename, "order_number": order_number,
-                     "recipient": None, "tracking": None, "ocr_text": "",
-                     "error": "PDF 支持未安装"}]
-        try:
-            images = convert_from_bytes(file_bytes, dpi=300)
-        except Exception as e:
-            return [{"filename": filename, "order_number": order_number,
-                     "recipient": None, "tracking": None, "ocr_text": "",
-                     "error": f"PDF 转换失败: {e}"}]
-
-        for i, img in enumerate(images):
-            processed = preprocess_image(img)
-            text = pytesseract.image_to_string(processed, config='--psm 6')
-            tracking = extract_tracking(text)
-            recipient = extract_recipient(text)
-            if tracking:  # Only keep pages with tracking info
-                page_label = f"{filename} (p{i+1})" if len(images) > 1 else filename
-                results.append({
-                    "filename": page_label,
-                    "order_number": order_number,
-                    "recipient": recipient,
-                    "tracking": tracking,
-                    "ocr_text": text,
-                    "error": None,
-                })
-
-        if not results:
-            # No tracking found on any page
-            # Try concatenating all text for one more attempt
-            all_text = ""
-            for img in images:
-                all_text += pytesseract.image_to_string(preprocess_image(img), config='--psm 6') + "\n"
-            tracking = extract_tracking(all_text)
-            recipient = extract_recipient(all_text)
-            results.append({
-                "filename": filename,
-                "order_number": order_number,
-                "recipient": recipient,
-                "tracking": tracking,
-                "ocr_text": all_text[:500],
-                "error": None if tracking else "未识别到 Tracking Number",
-            })
-    else:
-        # Image file
-        img = Image.open(io.BytesIO(file_bytes))
-        processed = preprocess_image(img)
-        text = pytesseract.image_to_string(processed, config='--psm 6')
-        tracking = extract_tracking(text)
-        recipient = extract_recipient(text)
-        results.append({
-            "filename": filename,
-            "order_number": order_number,
-            "recipient": recipient,
-            "tracking": tracking,
-            "ocr_text": text,
-            "error": None if tracking else "未识别到 Tracking Number",
-        })
-
-    return results
+def process_file(filename: str) -> dict:
+    """处理一个上传文件：只解析文件名，不读取文件内容。"""
+    order, tracking = parse_filename(filename)
+    return {
+        "filename": filename,
+        "order_number": order,
+        "tracking": tracking,
+        "error": None if tracking else "文件名中没有下划线，无法提取 Tracking",
+    }
 
 
 # ── Excel ────────────────────────────────────────────────────────────────────
@@ -253,14 +141,14 @@ def read_excel(excel_bytes: bytes):
 # ── UI ───────────────────────────────────────────────────────────────────────
 
 st.markdown("# 📦 面单识别 → Tracking 回填")
-st.markdown("上传面单 PDF（文件名 = 订单号），自动识别 Tracking，按订单号精准匹配回填到 Excel")
-st.caption("✅ 完全免费 | 支持 PDF + 图片批量 | 按订单号精准匹配")
+st.markdown("上传面单文件（**文件名 = 订单号_Tracking**），直接从文件名提取 Tracking，按订单号精准匹配回填到 Excel")
+st.caption("✅ 完全免费 | 无需 OCR，秒出结果 | 按订单号精准匹配")
 
 # ── Step 1 ───────────────────────────────────────────────────────────────────
 
 st.markdown("---")
 st.markdown("### ① 上传面单")
-st.caption("⚠️ PDF 文件名必须是订单号，如 `114-8302232-3163464.pdf`")
+st.caption("⚠️ 文件名格式：`订单号_Tracking`，如 `114-8302232-3163464_1Z2W4A130342999947.pdf`（第一个下划线前 = 订单号，下划线后 = Tracking）")
 
 uploaded_files = st.file_uploader(
     "选择面单文件（PDF / PNG / JPG，可多选）",
@@ -270,55 +158,40 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
-    # Preview file list with extracted order numbers
+    # Preview file list with extracted order numbers + tracking
     preview_data = []
     for f in uploaded_files:
-        order = extract_order_from_filename(f.name)
-        ext = Path(f.name).suffix.lower()
+        order, tracking = parse_filename(f.name)
         preview_data.append({
             "文件": f.name,
             "提取的订单号": order,
-            "类型": "PDF" if ext == ".pdf" else "图片",
+            "提取的 Tracking": tracking if tracking else "⚠️ 无下划线",
         })
     st.dataframe(pd.DataFrame(preview_data), use_container_width=True, hide_index=True)
 
     if st.button("🔍 开始识别 Tracking", type="primary", use_container_width=True):
         all_results = []
-        progress = st.progress(0, text="正在识别...")
+        for f in uploaded_files:
+            r = process_file(f.name)
+            all_results.append({
+                "文件名": r["filename"],
+                "订单号": r["order_number"],
+                "Tracking #": r["tracking"],
+                "状态": f"❌ {r['error']}" if r["error"] else "✅ 成功",
+            })
 
-        for i, f in enumerate(uploaded_files):
-            progress.progress((i + 1) / len(uploaded_files),
-                            text=f"正在处理 {f.name} ({i+1}/{len(uploaded_files)})")
-            file_results = process_file(f.getvalue(), f.name)
-            for r in file_results:
-                all_results.append({
-                    "文件名": r["filename"],
-                    "订单号": r["order_number"],
-                    "Tracking #": r.get("tracking") or "",
-                    "收件人 (参考)": r.get("recipient") or "",
-                    "状态": f"❌ {r['error']}" if r.get("error") else "✅ 成功",
-                    "_ocr": r.get("ocr_text", ""),
-                })
-
-        progress.empty()
         st.session_state.extracted_labels = all_results
         n_ok = sum(1 for r in all_results if r["状态"].startswith("✅"))
         if n_ok > 0:
             st.success(f"识别完成！成功提取 {n_ok}/{len(all_results)} 条 Tracking")
         else:
-            st.error("识别失败，展开下方调试信息查看 OCR 原文")
+            st.error("未提取到 Tracking，请检查文件名中是否包含下划线")
 
 # Show results
 if st.session_state.extracted_labels:
     st.markdown("**识别结果：**")
     df = pd.DataFrame(st.session_state.extracted_labels)
-    st.dataframe(df[[c for c in df.columns if not c.startswith("_")]],
-                use_container_width=True, hide_index=True)
-
-    with st.expander("🔍 调试：OCR 原始文本"):
-        for r in st.session_state.extracted_labels:
-            st.markdown(f"**{r['文件名']}:**")
-            st.code(r.get("_ocr", ""), language=None)
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
 # ── Step 2 ───────────────────────────────────────────────────────────────────
 
@@ -364,7 +237,6 @@ if successful:
                     "订单号": order,
                     "Tracking": label["Tracking #"],
                     "Excel 收件人": rec["收件人"],
-                    "面单收件人": label.get("收件人 (参考)", ""),
                     "现有 Tracking": rec["现有 Tracking"],
                     "excel_row": rec["excel_row"],
                     "匹配": "✅ 精准匹配",
@@ -375,7 +247,6 @@ if successful:
                     "订单号": order,
                     "Tracking": label["Tracking #"],
                     "Excel 收件人": "",
-                    "面单收件人": label.get("收件人 (参考)", ""),
                     "现有 Tracking": "",
                     "excel_row": -1,
                     "匹配": "❌ Excel 中无此订单号",
@@ -395,9 +266,9 @@ if successful:
         st.markdown("**确认要回填的条目：**")
         df_match = pd.DataFrame(match_results)
         edited = st.data_editor(
-            df_match[["接受", "订单号", "匹配", "Tracking", "Excel 收件人", "面单收件人", "现有 Tracking"]],
+            df_match[["接受", "订单号", "匹配", "Tracking", "Excel 收件人", "现有 Tracking"]],
             use_container_width=True, hide_index=True,
-            disabled=["订单号", "匹配", "Tracking", "Excel 收件人", "面单收件人", "现有 Tracking"],
+            disabled=["订单号", "匹配", "Tracking", "Excel 收件人", "现有 Tracking"],
             column_config={
                 "接受": st.column_config.CheckboxColumn("✓ 接受", default=False),
                 "Tracking": st.column_config.TextColumn(width="large"),
@@ -439,8 +310,8 @@ if successful:
 with st.sidebar:
     st.markdown("### 📖 使用说明")
     st.markdown("""
-    1. 上传面单 PDF（**文件名 = 订单号**）
-    2. 点击「开始识别」提取 Tracking
+    1. 上传面单文件（**文件名 = 订单号_Tracking**）
+    2. 点击「开始识别」提取 Tracking（直接取文件名下划线后的部分）
     3. 上传 ParcelOutbound Excel
     4. 按订单号自动精准匹配
     5. 确认后下载更新的 Excel
@@ -448,14 +319,18 @@ with st.sidebar:
     st.divider()
     st.markdown("### ⚠️ 重要")
     st.markdown("""
-    PDF 文件名必须是订单号！
-    例如：`114-8302232-3163464.pdf`
-    系统会用文件名匹配 Excel 中的
-    「Platform Number/平台单号」列
+    文件名必须是 `订单号_Tracking`！
+    例如：
+    `114-8302232-3163464_1Z2W4A130342999947.pdf`
+    第一个下划线之前用于匹配 Excel 中的
+    「Platform Number/平台单号」列，
+    下划线之后的部分作为 Tracking 回填
     """)
     st.divider()
     st.markdown("### ℹ️ 支持格式")
     st.markdown("**面单：** PDF / PNG / JPG")
-    st.markdown("**快递：** UPS / FedEx / USPS")
+    st.markdown("**提取方式：** 文件名解析（无OCR）")
     st.divider()
     st.caption("✅ 完全免费，无需 API Key")
+
+
