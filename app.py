@@ -239,6 +239,7 @@ def read_excel(excel_bytes: bytes):
 
     return records, {
         "tracking_col": cols["tracking"],
+        "recipient_col": cols.get("recipient"),
         "main_sheet": main_sheet,
     }
 
@@ -407,14 +408,29 @@ if successful:
             st.info("没有可回填的条目")
         else:
             st.markdown(f"将回填 **{n_acc}** 条 Tracking Number")
+
+            rcpt_col = st.session_state.meta.get("recipient_col")
+            if rcpt_col:
+                fill_recipient = st.checkbox(
+                    "同时把面单识别的收件人回填到 Excel「收件人」列",
+                    value=True,
+                )
+            else:
+                fill_recipient = False
+                st.caption("（Excel 中未找到「收件人」列，只回填 Tracking）")
+
             if st.button(f"⬇️ 生成更新后的 Excel（{n_acc} 条）", type="primary", use_container_width=True):
                 wb_w = openpyxl.load_workbook(io.BytesIO(st.session_state.excel_bytes))
                 ws_w = wb_w[st.session_state.meta["main_sheet"]]
                 filled = 0
+                filled_rcpt = 0
                 for m in match_results:
                     if m["接受"] and m["excel_row"] > 0 and m["Tracking"]:
                         ws_w.cell(row=m["excel_row"], column=st.session_state.meta["tracking_col"]).value = m["Tracking"]
                         filled += 1
+                        if fill_recipient and rcpt_col and m.get("面单收件人"):
+                            ws_w.cell(row=m["excel_row"], column=rcpt_col).value = m["面单收件人"]
+                            filled_rcpt += 1
                 out = io.BytesIO()
                 wb_w.save(out)
                 out.seek(0)
@@ -425,7 +441,10 @@ if successful:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
-                st.success(f"✅ 共填入 {filled} 条 Tracking Number")
+                if fill_recipient:
+                    st.success(f"✅ 共填入 {filled} 条 Tracking、{filled_rcpt} 条收件人")
+                else:
+                    st.success(f"✅ 共填入 {filled} 条 Tracking Number")
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 
